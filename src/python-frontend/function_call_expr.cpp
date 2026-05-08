@@ -3114,6 +3114,29 @@ exprt function_call_expr::handle_list_sort() const
       "sort() positional arguments are not supported; "
       "use sort() with no arguments");
 
+  // sort() supports a `reverse=` keyword. `key=` is not handled yet; reject
+  // explicitly rather than dropping it silently.
+  bool reverse = false;
+  if (call_.contains("keywords"))
+  {
+    for (const auto &kw : call_["keywords"])
+    {
+      const std::string name = kw.value("arg", "");
+      if (name == "reverse")
+      {
+        exprt v = converter_.get_expr(kw["value"]);
+        if (!v.is_constant())
+          throw std::runtime_error(
+            "sort(reverse=...) requires a constant boolean");
+        reverse = v.is_true();
+      }
+      else
+        throw std::runtime_error(
+          "sort() keyword argument '" + name +
+          "' is not supported (only reverse=)");
+    }
+  }
+
   std::string list_display_name;
   const symbolt *list_symbol = get_object_list_symbol(list_display_name);
   materialize_list_symbol(list_symbol);
@@ -3153,7 +3176,29 @@ exprt function_call_expr::handle_list_sort() const
   sort_call.type() = empty_typet();
   sort_call.location() = converter_.get_location_from_decl(call_);
 
-  return sort_call;
+  // For reverse=True, sort ascending then reverse in place via the existing
+  // __ESBMC_list_reverse model. Wrap both calls in a code_blockt.
+  if (!reverse)
+    return sort_call;
+
+  const symbolt *reverse_func =
+    converter_.symbol_table().find_symbol("c:@F@__ESBMC_list_reverse");
+  if (!reverse_func)
+    throw std::runtime_error(
+      "__ESBMC_list_reverse function not found in symbol table");
+
+  code_function_callt reverse_call;
+  reverse_call.function() = symbol_expr(*reverse_func);
+  reverse_call.arguments().push_back(symbol_expr(*list_symbol));
+  reverse_call.type() = empty_typet();
+  reverse_call.location() = converter_.get_location_from_decl(call_);
+
+  python_list::reverse_type_info(list_id);
+
+  code_blockt block;
+  block.copy_to_operands(sort_call);
+  block.copy_to_operands(reverse_call);
+  return block;
 }
 
 exprt function_call_expr::handle_list_reverse() const
@@ -4496,75 +4541,103 @@ exprt function_call_expr::handle_general_function_call()
 
   // Fast-path: sorted() over a concrete int list can be materialized directly
   // in the frontend, avoiding expensive runtime list sorting/equality paths.
+  // Honour reverse=<constant bool>; bail to the model for any other keyword.
   if (func_name == "sorted" && call_["args"].size() == 1)
   {
-    exprt list_arg = converter_.get_expr(call_["args"][0]);
-    if (list_arg.is_symbol())
+    bool fast_path_reverse = false;
+    bool fast_path_ok = true;
+    if (call_.contains("keywords"))
     {
-      const std::string list_id = list_arg.identifier().as_string();
-      const size_t map_size = python_list::get_list_type_map_size(list_id);
-      if (map_size > 0 && map_size <= 32)
+      for (const auto &kw : call_["keywords"])
       {
-        struct sortable_elem
+        if (kw.value("arg", "") != "reverse")
         {
-          BigInt key;
-          size_t pos;
-        };
-
-        std::vector<sortable_elem> elems;
-        elems.reserve(map_size);
-        bool all_constant_ints = true;
-
-        for (size_t i = 0; i < map_size; ++i)
-        {
-          const std::string elem_id =
-            python_list::get_list_element_id(list_id, i);
-          if (elem_id.empty())
-          {
-            all_constant_ints = false;
-            break;
-          }
-
-          const symbolt *elem_sym = converter_.find_symbol(elem_id);
-          if (
-            !elem_sym || !elem_sym->value.is_constant() ||
-            !(elem_sym->type.is_signedbv() || elem_sym->type.is_unsignedbv()))
-          {
-            all_constant_ints = false;
-            break;
-          }
-
-          BigInt key = binary2integer(elem_sym->value.value().c_str(), true);
-          elems.push_back({key, i});
+          fast_path_ok = false;
+          break;
         }
-
-        if (all_constant_ints)
+        exprt v = converter_.get_expr(kw["value"]);
+        if (!v.is_constant())
         {
-          std::stable_sort(
-            elems.begin(),
-            elems.end(),
-            [](const sortable_elem &a, const sortable_elem &b) {
-              if (a.key == b.key)
-                return a.pos < b.pos;
-              return a.key < b.key;
-            });
+          fast_path_ok = false;
+          break;
+        }
+        fast_path_reverse = v.is_true();
+      }
+    }
 
-          nlohmann::json sorted_list;
-          sorted_list["_type"] = "List";
-          sorted_list["elts"] = nlohmann::json::array();
-          converter_.copy_location_fields_from_decl(call_, sorted_list);
-          for (const auto &elem : elems)
+    if (fast_path_ok)
+    {
+      exprt list_arg = converter_.get_expr(call_["args"][0]);
+      if (list_arg.is_symbol())
+      {
+        const std::string list_id = list_arg.identifier().as_string();
+        const size_t map_size = python_list::get_list_type_map_size(list_id);
+        if (map_size > 0 && map_size <= 32)
+        {
+          struct sortable_elem
           {
-            nlohmann::json cst;
-            cst["_type"] = "Constant";
-            cst["value"] = elem.key.to_int64();
-            cst["kind"] = nullptr;
-            converter_.copy_location_fields_from_decl(call_, cst);
-            sorted_list["elts"].push_back(cst);
+            BigInt key;
+            size_t pos;
+          };
+
+          std::vector<sortable_elem> elems;
+          elems.reserve(map_size);
+          bool all_constant_ints = true;
+
+          for (size_t i = 0; i < map_size; ++i)
+          {
+            const std::string elem_id =
+              python_list::get_list_element_id(list_id, i);
+            if (elem_id.empty())
+            {
+              all_constant_ints = false;
+              break;
+            }
+
+            const symbolt *elem_sym = converter_.find_symbol(elem_id);
+            if (
+              !elem_sym || !elem_sym->value.is_constant() ||
+              !(elem_sym->type.is_signedbv() || elem_sym->type.is_unsignedbv()))
+            {
+              all_constant_ints = false;
+              break;
+            }
+
+            BigInt key = binary2integer(elem_sym->value.value().c_str(), true);
+            elems.push_back({key, i});
           }
 
-          python_list sorted_list_expr(converter_, sorted_list);
-          return sorted_list_expr.get();
+          if (all_constant_ints)
+          {
+            std::stable_sort(
+              elems.begin(),
+              elems.end(),
+              [](const sortable_elem &a, const sortable_elem &b) {
+                if (a.key == b.key)
+                  return a.pos < b.pos;
+                return a.key < b.key;
+              });
+
+            if (fast_path_reverse)
+              std::reverse(elems.begin(), elems.end());
+
+            nlohmann::json sorted_list;
+            sorted_list["_type"] = "List";
+            sorted_list["elts"] = nlohmann::json::array();
+            converter_.copy_location_fields_from_decl(call_, sorted_list);
+            for (const auto &elem : elems)
+            {
+              nlohmann::json cst;
+              cst["_type"] = "Constant";
+              cst["value"] = elem.key.to_int64();
+              cst["kind"] = nullptr;
+              converter_.copy_location_fields_from_decl(call_, cst);
+              sorted_list["elts"].push_back(cst);
+            }
+
+            python_list sorted_list_expr(converter_, sorted_list);
+            return sorted_list_expr.get();
+          }
         }
       }
     }
@@ -5541,6 +5614,31 @@ exprt function_call_expr::handle_general_function_call()
       call.arguments().push_back(arg);
 
     arg_index++;
+  }
+
+  // Forward keyword arguments to their parameter slots so the callee
+  // receives the supplied value. The validation loop below only fills in
+  // default values for *missing* params, so kwargs would otherwise be
+  // marked "provided" yet never actually passed.
+  if (call_.contains("keywords") && call_["keywords"].is_array())
+  {
+    for (const auto &kw : call_["keywords"])
+    {
+      if (!kw.contains("arg") || kw["arg"].is_null())
+        continue; // skip **kwargs unpacking
+      const std::string kw_name = kw["arg"].get<std::string>();
+      for (size_t i = 0; i < params.size(); ++i)
+      {
+        if (params[i].get_base_name().as_string() == kw_name)
+        {
+          exprt kw_val = converter_.get_expr(kw["value"]);
+          if (call.arguments().size() <= i)
+            call.arguments().resize(i + 1);
+          call.arguments()[i] = kw_val;
+          break;
+        }
+      }
+    }
   }
 
   // Add default arguments for missing parameters
