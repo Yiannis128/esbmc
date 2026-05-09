@@ -1287,6 +1287,20 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
     break;
   }
 
+  // C++17/20 class template argument deduction (CTAD): a class template
+  // name written without explicit args resolves through deduction to a
+  // concrete specialisation; lower to that specialisation.
+  case clang::Type::DeducedTemplateSpecialization:
+  {
+    const clang::DeducedType &dt =
+      static_cast<const clang::DeducedType &>(the_type);
+    if (dt.getDeducedType().isNull())
+      return true;
+    if (get_type(dt.getDeducedType(), new_type))
+      return true;
+    break;
+  }
+
 #if CLANG_VERSION_MAJOR < 14
 #  define BITINT_TAG clang::Type::ExtInt
 #  define BITINT_TYPE clang::ExtIntType
