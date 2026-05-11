@@ -1601,7 +1601,8 @@ smt_convt::resultt bmct::run_thread(std::shared_ptr<symex_target_equationt> &eq)
         {
           log_warning(
             "Vacuous discharge: claim '{}' has unsatisfiable path "
-            "assumptions (loop invariant likely implies the loop guard).",
+            "assumptions; possible causes include an over-constrained loop "
+            "invariant, requires clause, or upstream assume.",
             keeper.claim_cstr);
           vacuity_detected = true;
         }
@@ -1927,8 +1928,9 @@ smt_convt::resultt bmct::multi_property_check(
       {
         if (is_vacuous)
           log_status(
-            "{}? UNKNOWN{}: '{}' (vacuous discharge: path is unreachable; "
-            "loop invariant likely implies the loop guard)",
+            "{}? UNKNOWN{}: '{}' (vacuous discharge: path assumptions are "
+            "unsatisfiable; possible causes include an over-constrained "
+            "loop invariant, requires clause, or upstream assume)",
             YELLOW,
             RESET,
             prettify_solidity_expr(claim.claim_cstr));
