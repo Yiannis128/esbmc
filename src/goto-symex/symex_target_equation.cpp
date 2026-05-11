@@ -579,8 +579,17 @@ void runtime_encoded_equationt::pop_ctx()
   assumpt_chain.pop_back();
 }
 
-void runtime_encoded_equationt::convert(smt_convt &smt_conv, bool)
+void runtime_encoded_equationt::convert(smt_convt &smt_conv, bool vacuity_mode)
 {
+  // The incremental path doesn't re-walk SSA_steps, so the per-assertion
+  // path-assumption rewrite that vacuity mode needs cannot be applied here.
+  // Fail loudly rather than producing normal-mode results under a vacuity
+  // probe.
+  (void)vacuity_mode;
+  assert(
+    !vacuity_mode &&
+    "runtime_encoded_equationt::convert does not support vacuity mode");
+
   // Don't actually convert. We've already done most of the conversion by now
   // (probably), instead flush all unconverted instructions. We don't push
   // a context, because a) where do we unpop it, but b) we're never going to

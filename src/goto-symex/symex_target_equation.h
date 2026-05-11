@@ -82,6 +82,9 @@ public:
   // its path assumption alone instead of `not(assumpt -> cond)`. The final
   // OR over the assertions vector is then UNSAT iff every kept claim's path
   // is unreachable — i.e. the discharge is vacuous.
+  // Note: `runtime_encoded_equationt` overrides `convert` and does NOT
+  // support vacuity mode (it asserts `!vacuity_mode`); incremental BMC
+  // callers must run vacuity probes through the non-incremental path.
   virtual void convert(smt_convt &smt_conv, bool vacuity_mode = false);
   void convert_internal_step(
     smt_convt &smt_conv,
