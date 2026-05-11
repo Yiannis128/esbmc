@@ -80,6 +80,8 @@ std::string lessthanequal2t::field_names[esbmct::num_type_fields] =
   {"side_1", "side_2", "", "", ""};
 std::string greaterthanequal2t::field_names[esbmct::num_type_fields] =
   {"side_1", "side_2", "", "", ""};
+std::string cmp_three_way2t::field_names[esbmct::num_type_fields] =
+  {"side_1", "side_2", "", "", ""};
 std::string not2t::field_names[esbmct::num_type_fields] =
   {"value", "", "", "", ""};
 std::string and2t::field_names[esbmct::num_type_fields] =
@@ -99,8 +101,6 @@ std::string bitxor2t::field_names[esbmct::num_type_fields] =
 std::string bitnand2t::field_names[esbmct::num_type_fields] =
   {"side_1", "side_2", "", "", ""};
 std::string bitnor2t::field_names[esbmct::num_type_fields] =
-  {"side_1", "side_2", "", "", ""};
-std::string bitnxor2t::field_names[esbmct::num_type_fields] =
   {"side_1", "side_2", "", "", ""};
 std::string lshr2t::field_names[esbmct::num_type_fields] =
   {"side_1", "side_2", "", "", ""};

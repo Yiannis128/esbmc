@@ -45,6 +45,7 @@
   BOOST_PP_LIST_CONS(greaterthan,                                              \
   BOOST_PP_LIST_CONS(lessthanequal,                                            \
   BOOST_PP_LIST_CONS(greaterthanequal,                                         \
+  BOOST_PP_LIST_CONS(cmp_three_way,                                            \
   BOOST_PP_LIST_CONS(not,                                                      \
   BOOST_PP_LIST_CONS(and,                                                      \
   BOOST_PP_LIST_CONS(or,                                                       \
@@ -55,7 +56,6 @@
   BOOST_PP_LIST_CONS(bitxor,                                                   \
   BOOST_PP_LIST_CONS(bitnand,                                                  \
   BOOST_PP_LIST_CONS(bitnor,                                                   \
-  BOOST_PP_LIST_CONS(bitnxor,                                                  \
   BOOST_PP_LIST_CONS(bitnot,                                                   \
   BOOST_PP_LIST_CONS(lshr,                                                     \
   BOOST_PP_LIST_CONS(neg,                                                      \

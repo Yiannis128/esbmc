@@ -435,7 +435,7 @@ void symex_target_equationt::check_for_duplicate_assigns() const
   for (std::map<std::string, unsigned int>::const_iterator it =
          countmap.begin();
        it != countmap.end();
-       it++)
+       ++it)
   {
     if (it->second != 1)
     {
@@ -450,7 +450,7 @@ unsigned int symex_target_equationt::clear_assertions()
 {
   unsigned int num_asserts = 0;
 
-  for (SSA_stepst::iterator it = SSA_steps.begin(); it != SSA_steps.end(); it++)
+  for (SSA_stepst::iterator it = SSA_steps.begin(); it != SSA_steps.end(); ++it)
   {
     if (it->type == goto_trace_stept::ASSERT)
     {
@@ -525,7 +525,7 @@ void runtime_encoded_equationt::flush_latest_instructions()
   }
   else
   {
-    run_it++;
+    ++run_it;
     if (run_it == SSA_steps.end())
     {
       // There is in fact, nothing to do
@@ -548,7 +548,7 @@ void runtime_encoded_equationt::flush_latest_instructions()
       *run_it,
       /*vacuity_mode=*/false);
 
-  run_it--;
+  --run_it;
   cvt_progress = run_it;
 }
 
