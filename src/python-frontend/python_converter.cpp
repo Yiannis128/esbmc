@@ -1526,6 +1526,15 @@ exprt python_converter::handle_string_type_mismatch(
   if (!((lhs_is_string && !rhs_is_string) || (!lhs_is_string && rhs_is_string)))
     return nil_exprt(); // No mismatch, return nil to indicate no action taken
 
+  // Bail out on void* vs string;
+  // the caller's strcmp path handles it instead of folding to a static False
+  // (the void* may hold a string).
+  auto is_void_ptr = [](const typet &t) {
+    return t.is_pointer() && t.subtype().id() == "empty";
+  };
+  if (is_void_ptr(lhs.type()) || is_void_ptr(rhs.type()))
+    return nil_exprt();
+
   exprt lhs_char_value = python_char_utils::get_char_value_as_int(lhs, false);
   exprt rhs_char_value = python_char_utils::get_char_value_as_int(rhs, false);
 
@@ -1798,6 +1807,50 @@ exprt python_converter::get_binary_operator_expr(const nlohmann::json &element)
     if (element.contains("comparators") && element["comparators"].size() > 1)
       return handle_chained_comparisons_logic(element, string_result);
     return string_result;
+  }
+
+  // void* vs string: emit `strcmp(a, b) op 0`
+  // instead of decaying to pointer equality or returning a static False.
+  // Hits when one side is an unannotated class attribute holding a string.
+  if (op == "Eq" || op == "NotEq")
+  {
+    auto is_void_ptr = [](const typet &t) {
+      return t.is_pointer() && t.subtype().id() == "empty";
+    };
+    auto is_string_like = [](const typet &t) {
+      return (t.is_array() || t.is_pointer()) && t.subtype() == char_type();
+    };
+    const bool lhs_void = is_void_ptr(lhs.type());
+    const bool rhs_void = is_void_ptr(rhs.type());
+    if (
+      (lhs_void && is_string_like(rhs.type())) ||
+      (rhs_void && is_string_like(lhs.type())))
+    {
+      const symbolt *strcmp_symbol = symbol_table_.find_symbol("c:@F@strcmp");
+      if (strcmp_symbol)
+      {
+        // Normalise each side to char*: cast void*, take base address of arrays.
+        const typet char_ptr = pointer_typet(char_type());
+        auto as_char_ptr = [&](const exprt &e) -> exprt {
+          if (is_void_ptr(e.type()))
+            return typecast_exprt(e, char_ptr);
+          if (e.type().is_array())
+            return string_handler_.get_array_base_address(e);
+          return e;
+        };
+
+        side_effect_expr_function_callt strcmp_call;
+        strcmp_call.function() = symbol_expr(*strcmp_symbol);
+        strcmp_call.arguments() = {as_char_ptr(lhs), as_char_ptr(rhs)};
+        strcmp_call.location() = get_location_from_decl(element);
+        strcmp_call.type() = int_type();
+
+        exprt result(map_operator(op, bool_type()), bool_type());
+        result.copy_to_operands(strcmp_call, gen_zero(int_type()));
+        result.location() = get_location_from_decl(element);
+        return result;
+      }
+    }
   }
 
   // Handle type mismatches
@@ -2893,8 +2946,7 @@ exprt python_converter::get_function_call(const nlohmann::json &element)
   // is academic for the safety properties we check.
   if (
     element["func"]["_type"] == "Name" &&
-    (element["func"]["id"] == "set" ||
-     element["func"]["id"] == "frozenset") &&
+    (element["func"]["id"] == "set" || element["func"]["id"] == "frozenset") &&
     element.contains("args") && element["args"].size() == 1)
   {
     exprt iterable_expr = get_expr(element["args"][0]);
@@ -3794,7 +3846,7 @@ bool python_converter::is_bytes_literal(const nlohmann::json &element)
     const typet &subtype = current_element_type.subtype();
     if (subtype.id() == "unsignedbv")
     {
-      // Convert dstring width to integer
+      // Convert irep_idt width to integer
       const irep_idt &width_str = subtype.width();
       try
       {
@@ -4897,6 +4949,19 @@ exprt python_converter::get_expr(const nlohmann::json &element)
     const nlohmann::json &slice = element["slice"];
     typet array_type = ns.follow(array.type());
 
+    // Unwrap pointer-to-dict so d[key] reaches the dict handler when
+    // d is held by pointer (e.g. dict-of-class-value via the symbol table).
+    typet array_type_for_dict = array_type;
+    bool array_is_dict_pointer = false;
+    if (array_type_for_dict.is_pointer())
+    {
+      typet pointed = ns.follow(array_type_for_dict.subtype());
+      if (pointed.is_struct() && dict_handler_->is_dict_type(pointed))
+      {
+        array_type_for_dict = pointed;
+        array_is_dict_pointer = true;
+      }
+    }
     // Handle tuple subscripting - tuples are structs, not arrays
     if (tuple_handler_->is_tuple_type(array_type))
     {
@@ -4905,8 +4970,18 @@ exprt python_converter::get_expr(const nlohmann::json &element)
     }
 
     // Handle dictionary subscript with type inference from annotations
-    if (array_type.is_struct() && dict_handler_->is_dict_type(array_type))
+    if (
+      array_type_for_dict.is_struct() &&
+      dict_handler_->is_dict_type(array_type_for_dict))
     {
+      // Dereference once so the handler operates on the dict struct.
+      if (array_is_dict_pointer)
+      {
+        dereference_exprt deref(array, array_type_for_dict);
+        deref.type() = array_type_for_dict;
+        array = std::move(deref);
+      }
+
       // Try to resolve the expected return type from the dict's type annotation
       typet expected_type =
         dict_handler_->resolve_expected_type_for_dict_subscript(array);
@@ -6820,7 +6895,8 @@ typet python_converter::resolve_variable_type(
   const std::string &var_name,
   const locationt &loc)
 {
-  nlohmann::json decl_node = get_var_node(var_name, *ast_json);
+  std::string function = loc.get_function().as_string();
+  nlohmann::json decl_node = find_var_decl(var_name, function, *ast_json);
 
   if (!decl_node.empty())
   {
@@ -6852,7 +6928,6 @@ typet python_converter::resolve_variable_type(
   }
 
   std::string filename = loc.get_file().as_string();
-  std::string function = loc.get_function().as_string();
   std::string symbol_id = "py:" + filename + "@F@" + function + "@" + var_name;
 
   const symbolt *sym = symbol_table_.find_symbol(symbol_id);
@@ -8809,6 +8884,16 @@ typet python_converter::infer_return_type_from_body(const nlohmann::json &body)
     {
       const auto &ret_val = stmt["value"];
 
+      // `return self` in a method: surface the class's struct value type so
+      // callers can assign to a `Class`-typed local. Without this, fallback
+      // inference picks up `Class *` from `self` and the call-site assignment
+      // becomes a pointer-to-struct mismatch that trips an assertion in
+      // value_set::make_member on later member access. See GitHub #4514.
+      if (
+        ret_val["_type"] == "Name" && ret_val.contains("id") &&
+        ret_val["id"] == "self" && !current_class_name_.empty())
+        return type_handler_.get_typet(current_class_name_);
+
       // If returning a tuple, infer its type
       if (ret_val["_type"] == "Tuple")
         return tuple_handler_->get_tuple_expr(ret_val).type();
@@ -9132,6 +9217,53 @@ void python_converter::get_function_definition(
   current_func_name_ = caller_func_name;
 }
 
+typet python_converter::infer_tuple_struct_from_value(
+  const nlohmann::json &value_node,
+  const std::unordered_map<std::string, nlohmann::json> &param_annotations)
+{
+  if (!value_node.is_object() || !value_node.contains("_type"))
+    return empty_typet();
+
+  if (value_node["_type"] != "Tuple" || !value_node.contains("elts"))
+    return empty_typet();
+
+  std::vector<typet> elem_types;
+  elem_types.reserve(value_node["elts"].size());
+
+  for (const auto &elt : value_node["elts"])
+  {
+    typet elem_type;
+    const std::string elt_kind = elt.value("_type", "");
+
+    if (elt_kind == "Constant" && elt.contains("value"))
+    {
+      const auto &v = elt["value"];
+      if (v.is_boolean())
+        elem_type = bool_type();
+      else if (v.is_number_integer())
+        elem_type = long_long_int_type();
+      else if (v.is_number_float())
+        elem_type = double_type();
+      else if (v.is_string())
+        elem_type = gen_pointer_type(char_type());
+    }
+    else if (elt_kind == "Name" && elt.contains("id"))
+    {
+      const std::string name = elt["id"].get<std::string>();
+      auto it = param_annotations.find(name);
+      if (it != param_annotations.end())
+        elem_type = get_type_from_annotation(it->second, elt);
+    }
+
+    if (elem_type.is_nil() || elem_type.id().as_string().empty())
+      elem_type = any_type();
+
+    elem_types.push_back(elem_type);
+  }
+
+  return tuple_handler_->create_tuple_struct_type(elem_types);
+}
+
 typet python_converter::infer_attr_type_from_usage(
   const std::string &class_name,
   const std::string &attr_name)
@@ -9437,6 +9569,17 @@ void python_converter::get_attributes_from_self(
         if (unset(resolved))
           resolved = infer_attr_type_from_usage(current_class_name_, attr_name);
         type = unset(resolved) ? any_type() : resolved;
+      }
+      else if (annotated_type == "tuple" || annotated_type == "Tuple")
+      {
+        // Bare `tuple` annotation: recover element types from the assigned
+        // value when it is a Tuple literal so later `obj.attr` reads carry the
+        // struct shape needed for unpacking (GitHub #4515).
+        if (stmt.contains("value"))
+          type =
+            infer_tuple_struct_from_value(stmt["value"], param_annotations);
+        if (type.is_nil() || type.is_empty())
+          type = type_handler_.get_typet(annotated_type);
       }
       else
         type = type_handler_.get_typet(annotated_type);

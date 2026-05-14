@@ -357,6 +357,10 @@ private:
       {
         var_node =
           find_annotated_assign(var_name, (*parent_func)["args"]["args"]);
+        // Also search keyword-only args
+        if (var_node.empty() && (*parent_func)["args"].contains("kwonlyargs"))
+          var_node = find_annotated_assign(
+            var_name, (*parent_func)["args"]["kwonlyargs"]);
       }
 
       if (!has_annotation(var_node) && (*parent_func).contains("body"))
@@ -549,6 +553,27 @@ private:
             has_partial_annotation = true;
             needs_inference = true; // Try to refine with element type
           }
+          else if (current_type == "tuple")
+          {
+            // Bare `tuple` annotation: try to specialise to
+            // `tuple[T0, T1, ...]` by inspecting call sites so the unpacker
+            // can recover the struct shape (GitHub #4515).
+            if (!function_calls.empty())
+            {
+              std::vector<std::string> elem_types =
+                infer_tuple_param_types_from_calls(i, function_calls);
+              if (!elem_types.empty())
+              {
+                int lineno = param.value("lineno", 0);
+                int col_offset =
+                  param.value("col_offset", 0) +
+                  param["arg"].template get<std::string>().size() + 1;
+                param["annotation"] = create_tuple_subscript_annotation(
+                  elem_types, lineno, col_offset, lineno);
+              }
+            }
+            continue;
+          }
           else
             continue; // Fully annotated, skip
         }
@@ -727,6 +752,62 @@ private:
     }
 
     return types;
+  }
+
+  // For a parameter annotated bare `tuple`, recover the element types by
+  // intersecting all call sites that pass a Tuple literal at position
+  // @p param_index. Returns empty when arity disagrees, any caller passes a
+  // non-Tuple-literal argument, or no usable call sites exist; element types
+  // that disagree across calls fall back to "Any". Used to specialise bare
+  // `tuple` parameter annotations to `tuple[T0, T1, ...]` so tuple-unpacking
+  // sees the struct shape (GitHub #4515).
+  std::vector<std::string> infer_tuple_param_types_from_calls(
+    size_t param_index,
+    const std::vector<Json> &function_calls)
+  {
+    std::vector<std::string> result;
+    bool initialized = false;
+
+    for (const Json &call : function_calls)
+    {
+      if (!call.contains("args") || param_index >= call["args"].size())
+        continue;
+
+      const Json &arg = call["args"][param_index];
+      if (
+        !arg.contains("_type") || arg["_type"] != "Tuple" ||
+        !arg.contains("elts"))
+        return {};
+
+      std::vector<std::string> shape;
+      shape.reserve(arg["elts"].size());
+      for (const Json &elt : arg["elts"])
+      {
+        std::string t = get_argument_type(elt);
+        // Empty result and bare container kinds without parameters all
+        // resolve to incomplete/empty types downstream. Clamp them to "Any"
+        // so the synthesised struct never carries an empty_typet() component.
+        if (t.empty() || t == "tuple" || t == "list" || t == "dict")
+          t = "Any";
+        shape.push_back(std::move(t));
+      }
+
+      if (!initialized)
+      {
+        result = std::move(shape);
+        initialized = true;
+      }
+      else
+      {
+        if (shape.size() != result.size())
+          return {};
+        for (size_t k = 0; k < result.size(); ++k)
+          if (result[k] != shape[k])
+            result[k] = "Any";
+      }
+    }
+
+    return result;
   }
 
   bool are_all_user_classes(const std::vector<std::string> &types) const
@@ -1944,6 +2025,9 @@ private:
           json_utils::find_imported_function(ast_, func_name);
         auto module = module_manager_->get_module(import_node["module"]);
 
+        if (!module)
+          throw std::runtime_error("module not found");
+
         // Try to get it as a function first
         try
         {
@@ -2346,11 +2430,21 @@ private:
     {
       rhs_node =
         find_annotated_assign(rhs_var_name, (*current_func)["args"]["args"]);
+      // Also search keyword-only args
+      if (rhs_node.empty() && (*current_func)["args"].contains("kwonlyargs"))
+        rhs_node = find_annotated_assign(
+          rhs_var_name, (*current_func)["args"]["kwonlyargs"]);
     }
 
     // Find RHS variable in the current function args
     if (rhs_node.empty() && body.contains("args"))
+    {
       rhs_node = find_annotated_assign(rhs_var_name, body["args"]["args"]);
+      // Also search keyword-only args
+      if (rhs_node.empty() && body["args"].contains("kwonlyargs"))
+        rhs_node =
+          find_annotated_assign(rhs_var_name, body["args"]["kwonlyargs"]);
+    }
 
     // Find RHS variable node in the global scope
     if (rhs_node.empty())
@@ -2358,6 +2452,20 @@ private:
 
     if (rhs_node.empty())
     {
+      // Defensive fallback: when the RHS names a Python iterable-producing
+      // builtin (e.g. `alias = range`), there is no AST declaration to find.
+      // Return the builtin's mapped type so a bare RHS does not abort type
+      // inference. The four entries below are safe because `builtin_functions`
+      // maps each of them to its own name as the call-result type tag
+      // ("range" -> "range", ...), which is also a workable placeholder for
+      // the callable. Do NOT extend this set without verifying the same
+      // property -- adding e.g. "iter" would return "iterator" as the type
+      // of the callable itself, which is wrong.
+      static const std::unordered_set<std::string> iterable_builtins = {
+        "range", "enumerate", "zip", "reversed"};
+      if (iterable_builtins.count(rhs_var_name))
+        return builtin_functions.at(rhs_var_name);
+
       const auto &lineno = element["lineno"].template get<int>();
 
       std::ostringstream oss;
@@ -3553,9 +3661,13 @@ private:
     for (auto &stmt : while_stmt["body"])
     {
       // Look for pattern: loop_var: Any = iterable[ESBMC_index_N]
+      // A bare annotation like `x: int` has value == null; nlohmann::json's
+      // `contains("value")` returns true for present-but-null members, so an
+      // explicit is_null() guard is required to avoid a type_error on the
+      // subsequent subscript.
       if (
         stmt["_type"] == "AnnAssign" && stmt.contains("value") &&
-        stmt["value"]["_type"] == "Subscript")
+        !stmt["value"].is_null() && stmt["value"]["_type"] == "Subscript")
       {
         if (!stmt["value"]["value"].contains("id"))
           continue;
@@ -3842,6 +3954,53 @@ private:
       {"end_col_offset", total_end_col}};
   }
 
+  // Build a `tuple[t0, t1, ...]` Subscript annotation node. Used by the
+  // parameter-inference pass to specialise bare `tuple` annotations once
+  // the element types have been recovered from call sites (GitHub #4515).
+  Json create_tuple_subscript_annotation(
+    const std::vector<std::string> &elem_types,
+    int lineno,
+    int col_offset,
+    int end_lineno)
+  {
+    static const std::string base_type = "tuple";
+    int base_end_col = col_offset + base_type.size();
+    int slice_col = base_end_col + 1;
+
+    Json elts = Json::array();
+    int cur = slice_col;
+    for (const std::string &t : elem_types)
+    {
+      int end_col = cur + t.size();
+      elts.push_back(
+        create_name_annotation(t, lineno, cur, end_lineno, end_col));
+      cur = end_col + 2; // ", "
+    }
+    int slice_end_col = cur - 2;
+    int total_end_col = slice_end_col + 1;
+
+    Json slice = {
+      {"_type", "Tuple"},
+      {"elts", elts},
+      {"ctx", {{"_type", "Load"}}},
+      {"lineno", lineno},
+      {"col_offset", slice_col},
+      {"end_lineno", end_lineno},
+      {"end_col_offset", slice_end_col}};
+
+    return {
+      {"_type", "Subscript"},
+      {"value",
+       create_name_annotation(
+         base_type, lineno, col_offset, end_lineno, base_end_col)},
+      {"slice", slice},
+      {"ctx", {{"_type", "Load"}}},
+      {"lineno", lineno},
+      {"col_offset", col_offset},
+      {"end_lineno", end_lineno},
+      {"end_col_offset", total_end_col}};
+  }
+
   Json create_annotation_from_type(
     const std::string &inferred_type,
     int lineno,
@@ -4009,13 +4168,7 @@ private:
           elem["targets"][0].contains("_type") &&
           elem["targets"][0]["_type"] == "Name" &&
           elem["targets"][0].contains("id") &&
-          elem["targets"][0]["id"].template get<std::string>() == node_name &&
-          elem.contains("value") && elem["value"].is_object() &&
-          elem["value"].contains("_type") &&
-          // Keep assign-based lookup for simple RHS forms used by frontend
-          // inference (e.g. Name/Attribute/BinOp), but avoid Call-based
-          // expressions that can trigger heavy paths in known buggy cases.
-          elem["value"]["_type"] != "Call") ||
+          elem["targets"][0]["id"].template get<std::string>() == node_name) ||
          (elem["_type"] == "arg" && elem["arg"] == node_name)))
       {
         return elem;
